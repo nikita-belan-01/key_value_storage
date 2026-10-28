@@ -27,7 +27,7 @@ func (s Server) exec(ctx context.Context, w *bufio.Writer, cmd *protocol.Command
 
 	switch cmd.Name {
 	case protocol.PingCmdName:
-		return protocol.WriteSimple(w, "PONG")
+		return s.ping(w, cmd)
 	case protocol.SetCmdName:
 		return s.set(ctx, w, cmd)
 	case protocol.GetCmdName:
@@ -47,12 +47,23 @@ func (s Server) exec(ctx context.Context, w *bufio.Writer, cmd *protocol.Command
 	}
 }
 
+func (s Server) ping(w *bufio.Writer, cmd *protocol.Command) error {
+	switch len(cmd.Args) {
+	case 0:
+		return protocol.WriteSimple(w, "PONG")
+	case 1:
+		return protocol.WriteBulk(w, cmd.Args[0])
+	default:
+		return wrongArgs(w, "ping")
+	}
+}
+
 func (s Server) set(ctx context.Context, w *bufio.Writer, cmd *protocol.Command) error {
 	if len(cmd.Args) < 2 {
 		return wrongArgs(w, "set")
 	}
 
-	ttl := s.conf.DefaultTTL
+	ttl := time.Duration(0)
 
 	if (len(cmd.Args)-2)%2 != 0 {
 		return protocol.WriteError(w, "ERR syntax error")
