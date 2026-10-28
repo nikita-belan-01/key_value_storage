@@ -2,13 +2,14 @@ package storage
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nikita-belan-01/key_value_storage/internal/glob"
+	"github.com/nikita-belan-01/key_value_storage/pkg/logger"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -35,6 +36,8 @@ type Storage struct {
 
 	stop     chan struct{}
 	stopOnce sync.Once
+
+	logger *logger.Logger
 }
 
 type entry struct {
@@ -48,7 +51,7 @@ func (e *entry) alive(now time.Time) bool {
 	return e.deadline.IsZero() || e.deadline.After(now)
 }
 
-func New(cleanUpInterval time.Duration, maxKeys int) (*Storage, error) {
+func New(logger *logger.Logger, cleanUpInterval time.Duration, maxKeys int) (*Storage, error) {
 	if cleanUpInterval <= 0 {
 		return nil, ErrInvalidCleanUpInterval
 	}
@@ -66,14 +69,15 @@ func New(cleanUpInterval time.Duration, maxKeys int) (*Storage, error) {
 		tail:    tail,
 		maxKeys: maxKeys,
 		stop:    make(chan struct{}),
+		logger: logger.With(func(c zerolog.Context) zerolog.Context {
+			return c.Str("component", "storage")
+		}),
 	}
 
 	go s.janitor(cleanUpInterval)
 
 	return s, nil
 }
-
-type keys []string
 
 func (s *Storage) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
@@ -123,8 +127,8 @@ func (s *Storage) Get(ctx context.Context, key string) ([]byte, error) {
 	s.rwMu.Lock()
 	defer s.rwMu.Unlock()
 
-	e, ok := s.m[key]
-	if !ok || !e.alive(time.Now()) {
+	e, ok := s.liveLocked(key, time.Now())
+	if !ok {
 		return nil, ErrKeyNotExistsOrExpired
 	}
 
@@ -136,6 +140,19 @@ func (s *Storage) Get(ctx context.Context, key string) ([]byte, error) {
 	return out, nil
 }
 
+func (s *Storage) Exists(ctx context.Context, key string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	s.rwMu.RLock()
+	defer s.rwMu.RUnlock()
+
+	_, ok := s.liveLocked(key, time.Now())
+
+	return ok, nil
+}
+
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -144,8 +161,8 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 	s.rwMu.Lock()
 	defer s.rwMu.Unlock()
 
-	e, ok := s.m[key]
-	if !ok || !e.alive(time.Now()) {
+	e, ok := s.liveLocked(key, time.Now())
+	if !ok {
 		return ErrKeyNotExistsOrExpired
 	}
 
@@ -180,8 +197,7 @@ func (s *Storage) Keys(ctx context.Context, pattern string) ([]string, error) {
 			break
 		}
 
-		v, ok := s.m[k]
-		if !ok || !v.alive(now) {
+		if _, ok := s.liveLocked(k, now); !ok {
 			continue
 		}
 
@@ -225,8 +241,7 @@ func (s *Storage) Scan(ctx context.Context, cursor string, pattern string, limit
 			break
 		}
 
-		v, ok := s.m[k]
-		if !ok || !v.alive(now) {
+		if _, ok := s.liveLocked(k, now); !ok {
 			continue
 		}
 
@@ -248,131 +263,13 @@ func (s *Storage) Stop() {
 	s.stopOnce.Do(func() { close(s.stop) })
 }
 
-func (s *Storage) unlink(e *entry) {
-	e.prev.next = e.next
-	e.next.prev = e.prev
-	e.prev, e.next = nil, nil
-}
-
-func (s *Storage) pushFront(e *entry) {
-	e.prev, e.next = s.head, s.head.next
-	s.head.next.prev = e
-	s.head.next = e
-}
-
-func (s *Storage) moveToFront(e *entry) {
-	if s.head.next == e {
-		return
+func (s *Storage) liveLocked(key string, now time.Time) (*entry, bool) {
+	e, ok := s.m[key]
+	if !ok || !e.alive(now) {
+		return nil, false
 	}
 
-	s.unlink(e)
-	s.pushFront(e)
-}
-
-func (s *Storage) evictLocked() {
-	for s.maxKeys > 0 && len(s.m) > s.maxKeys {
-		victim := s.tail.prev
-		if victim == s.head {
-			return
-		}
-
-		s.unlink(victim)
-		delete(s.m, victim.key)
-		s.keys = s.keys.delete(victim.key)
-	}
-}
-
-func (s *Storage) cleanUp() {
-	now := time.Now()
-
-	s.rwMu.Lock()
-	defer s.rwMu.Unlock()
-
-	alive := make(keys, 0, len(s.keys))
-	for _, k := range s.keys {
-		e, ok := s.m[k]
-		if ok && e.alive(now) {
-			alive = append(alive, k)
-			continue
-		}
-		if ok {
-			s.unlink(e)
-		}
-
-		delete(s.m, k)
-	}
-
-	s.keys = alive
-}
-
-func (s *Storage) janitor(every time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-
-	for {
-		select {
-		case <-t.C:
-			s.cleanUp()
-		case <-s.stop:
-			return
-		}
-	}
-}
-
-func (k keys) scanStart(after string, resuming bool, prefix string) int {
-	pos := 0
-
-	if resuming {
-		p, found := k.binarySearch(after)
-		pos = p
-
-		if found {
-			pos++
-		}
-	}
-
-	if prefix != "" {
-		if p, _ := k.binarySearch(prefix); p > pos {
-			pos = p
-		}
-	}
-
-	return pos
-}
-
-func (k keys) binarySearch(target string) (int, bool) {
-	left, right := 0, len(k)
-
-	for left < right {
-		mid := left + (right-left)/2
-
-		if k[mid] < target {
-			left = mid + 1
-		} else {
-			right = mid
-		}
-	}
-
-	return left, left < len(k) && k[left] == target
-}
-
-func (k keys) insert(key string) keys {
-	pos, _ := k.binarySearch(key)
-
-	k = append(k, "")
-	copy(k[pos+1:], k[pos:])
-	k[pos] = key
-
-	return k
-}
-
-func (k keys) delete(key string) keys {
-	pos, found := k.binarySearch(key)
-	if !found {
-		return k
-	}
-
-	return append(k[:pos], k[pos+1:]...)
+	return e, true
 }
 
 func normalizeLimit(limit int) int {
@@ -385,26 +282,4 @@ func normalizeLimit(limit int) int {
 	}
 
 	return limit
-}
-
-func encodeCursor(key string) string {
-	return cursorPrefix + hex.EncodeToString([]byte(key))
-}
-
-func decodeCursor(cursor string) (string, bool, error) {
-	if cursor == "" {
-		return "", false, nil
-	}
-
-	payload, ok := strings.CutPrefix(cursor, cursorPrefix)
-	if !ok {
-		return "", false, ErrBadCursor
-	}
-
-	raw, err := hex.DecodeString(payload)
-	if err != nil {
-		return "", false, ErrBadCursor
-	}
-
-	return string(raw), true, nil
 }
