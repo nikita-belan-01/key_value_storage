@@ -15,7 +15,6 @@ type Server struct {
 	IdleTimeout      time.Duration
 	ShutdownTimeout  time.Duration
 	CmdTimeout       time.Duration
-	DefaultTTL       time.Duration
 	SlowCmdThreshold time.Duration
 }
 
@@ -84,7 +83,7 @@ func newServer() (Server, error) {
 		return Server{}, err
 	}
 
-	if err = validateDuration(shutdownTimeout); err != nil {
+	if err = validateDuration(slowCmdThreshold); err != nil {
 		return Server{}, fmt.Errorf("SERVER_SLOW_CMD_THRESHOLD: %w", err)
 	}
 
